@@ -1,5 +1,5 @@
 import os
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 import pandas as pd
 import asyncio
@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, Numeric, Date, DateTime
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
 from sqlalchemy.orm import declarative_base
-from datetime import datetime
+from datetime import datetime, date
 
 load_dotenv()
 DB_NAME=os.getenv("DB_NAME")
@@ -139,3 +139,25 @@ async def parse_to_db(filename):
 
     except Exception as e:
         print(f"Ошибка при обработке файла {filename}: {e}")
+
+
+async def get_last_trading_date():
+    """Получаем последнюю дату торгов"""
+    async with async_session() as session:
+        result = await session.execute(
+            select(func.max(SpimexTradingResult.date))
+        )
+        return result.scalar()
+
+
+async def get_dynamics(start_date: date, end_date: date, oil_id: str = None):
+    """Получаем динамику за период"""
+    async with async_session() as session:
+        query = select(SpimexTradingResult).where(
+            SpimexTradingResult.date.between(start_date, end_date)
+        )
+        if oil_id:
+            query = query.where(SpimexTradingResult.oil_id == oil_id)
+
+        result = await session.execute(query)
+        return result.scalars().all()
