@@ -1,9 +1,7 @@
 import os
-from sqlalchemy import select, func
-
+from sqlalchemy import select, func, and_
 import pandas as pd
 import asyncio
-
 from dotenv import load_dotenv
 from sqlalchemy import Column, Integer, String, Numeric, Date, DateTime
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
@@ -11,11 +9,11 @@ from sqlalchemy.orm import declarative_base
 from datetime import datetime, date
 
 load_dotenv()
-DB_NAME=os.getenv("DB_NAME")
-DB_HOST=os.getenv("DB_HOST")
-DB_PORT=os.getenv("DB_PORT")
-DB_USER=os.getenv("DB_USER")
-DB_PASS=os.getenv("DB_PASS")
+DB_NAME = os.getenv("DB_NAME")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
 
 db_url = f"postgresql+asyncpg://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -38,9 +36,9 @@ class SpimexTradingResult(Base):
     updated_on = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
-
 engine = create_async_engine(db_url, echo=False)
 async_session = async_sessionmaker(engine, expire_on_commit=False)
+
 
 async def create_tables():
     async with engine.begin() as conn:
@@ -56,7 +54,7 @@ async def parse_to_db(filename):
         # Читаем Excel файл через pandas (в отдельном потоке)
         df = await asyncio.to_thread(pd.read_excel, filename, sheet_name='TRADE_SUMMARY', header=None)
 
-        # Находим строку с метрическими тоннами
+        # Поиск стартовой строки с метрическими тоннами
         metric_ton_row = None
         for i in range(len(df)):
             if isinstance(df.iloc[i, 1], str) and 'Единица измерения: Метрическая тонна' in df.iloc[i, 1]:
@@ -67,23 +65,21 @@ async def parse_to_db(filename):
             print(f"Не найдена строка с метрическими тоннами в файле {filename}")
             return
 
-        # Определяем индексы колонок
+        # Определяем индексы колонок (возможно нужно править под структуру)
         col_indices = {
             'code': 1, 'name': 2, 'basis': 3,
             'volume': 4, 'total': 5, 'count': 14
         }
 
-        # Собираем данные для сохранения
         data_to_save = []
         for i in range(metric_ton_row + 3, len(df)):
             row = df.iloc[i]
 
-            # Пропускаем строки с "Итого"
+            # Пропускаем суммарные строки
             if isinstance(row[col_indices['code']], str) and ('Итого:' in row[col_indices['code']] or
                                                               'Итого по секции:' in row[col_indices['code']]):
                 continue
 
-            # Пропускаем пустые строки
             if (pd.isna(row[col_indices['code']]) or
                     (isinstance(row[col_indices['code']], str) and row[col_indices['code']].strip() == '-') or
                     pd.isna(row[col_indices['count']]) or
@@ -120,10 +116,9 @@ async def parse_to_db(filename):
                 print(f"Ошибка при обработке строки {i + 1}: {e}")
                 continue
 
-        # Сохраняем данные в БД
+        # Сохраняем данные в БД, проверяя дубликаты
         if data_to_save:
             async with async_session() as session:
-                # Проверяем существование записей
                 for item in data_to_save:
                     result = await session.execute(
                         select(SpimexTradingResult).filter_by(
@@ -133,7 +128,6 @@ async def parse_to_db(filename):
                     )
                     if not result.scalars().first():
                         session.add(SpimexTradingResult(**item))
-
                 await session.commit()
                 print(f"Файл {filename} обработан, добавлено {len(data_to_save)} записей")
 
@@ -144,20 +138,51 @@ async def parse_to_db(filename):
 async def get_last_trading_date():
     """Получаем последнюю дату торгов"""
     async with async_session() as session:
-        result = await session.execute(
-            select(func.max(SpimexTradingResult.date))
-        )
+        result = await session.execute(select(func.max(SpimexTradingResult.date)))
         return result.scalar()
 
 
-async def get_dynamics(start_date: date, end_date: date, oil_id: str = None):
-    """Получаем динамику за период"""
+async def get_dynamics(start_date: date, end_date: date, oil_id: str = None,
+                       delivery_type_id: str = None, delivery_basis_id: str = None, limit: int = None):
+    """
+    Получаем динамику за период с возможностью фильтрации по oil_id, delivery_type_id, delivery_basis_id.
+    start_date и end_date обязателны — это основной смысл метода 'dynamics'.
+    """
     async with async_session() as session:
-        query = select(SpimexTradingResult).where(
-            SpimexTradingResult.date.between(start_date, end_date)
-        )
+        conditions = [SpimexTradingResult.date.between(start_date, end_date)]
+        if oil_id:
+            conditions.append(SpimexTradingResult.oil_id == oil_id)
+        if delivery_type_id:
+            conditions.append(SpimexTradingResult.delivery_type_id == delivery_type_id)
+        if delivery_basis_id:
+            conditions.append(SpimexTradingResult.delivery_basis_id == delivery_basis_id)
+
+        query = select(SpimexTradingResult).where(and_(*conditions)).order_by(SpimexTradingResult.date.asc())
+        if limit:
+            query = query.limit(limit)
+
+        result = await session.execute(query)
+        return result.scalars().all()
+
+
+async def get_trading_results(limit: int = 100, oil_id: str = None,
+                              delivery_type_id: str = None, delivery_basis_id: str = None, date_value: date = None):
+    """
+    Последние торговые результаты. Параметры фильтрации опциональны:
+    - date_value — если указан, вернёт записи только за дату
+    - иначе вернёт последние по дате записи (внутри limit)
+    """
+    async with async_session() as session:
+        query = select(SpimexTradingResult)
+        if date_value:
+            query = query.where(SpimexTradingResult.date == date_value)
         if oil_id:
             query = query.where(SpimexTradingResult.oil_id == oil_id)
+        if delivery_type_id:
+            query = query.where(SpimexTradingResult.delivery_type_id == delivery_type_id)
+        if delivery_basis_id:
+            query = query.where(SpimexTradingResult.delivery_basis_id == delivery_basis_id)
 
+        query = query.order_by(SpimexTradingResult.date.desc()).limit(limit)
         result = await session.execute(query)
         return result.scalars().all()
